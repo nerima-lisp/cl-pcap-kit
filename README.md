@@ -19,20 +19,21 @@ Outside that shell, arrange for libpcap to be available to the process loader.
 
 `capture-open-offline` and `capture-open-live` create capture handles. Use
 `with-offline-capture` or `with-live-capture` to close handles automatically.
-`capture-next` returns a packet with status `:packet`, `nil` with status
-`:timeout` when a live read times out, or `nil` with status `:eof` at the end of
-a saved capture. Packet timestamps are exact rational seconds since the Unix
+`capture-next` returns two values: `(packet, :packet)` when it reads a packet,
+`(nil, :timeout)` when a live read times out, or `(nil, :eof)` at the end of a
+saved capture. Packet timestamps are exact rational seconds since the Unix
 epoch. Packet bytes are copied into an owned octet vector; `packet-length`
 reports the original packet length and `packet-captured-length` reports the
-number of copied bytes.
+number of copied bytes. `capture-loop` passes each copied packet record to its
+callback.
 
 Use `capture-set-filter` to compile and install a BPF expression on a capture
-handle, and `capture-devices` to enumerate available capture devices. Open and
-filter errors signal `pcap-error`.
+handle, and `capture-devices` to enumerate available capture devices. Errors
+from opening, reading, filtering, or enumerating devices signal `pcap-error`.
 
 ## Capture ownership
 
 Capture handles own their native libpcap handle until closed. Use
 `with-capture`, `with-offline-capture`, or `with-live-capture` for scoped
-cleanup. Packet records own a byte vector copied before libpcap reuses its
-buffer. This library only reads captures; it does not send or generate packets.
+cleanup. Copied packet bytes remain available after the capture handle closes.
+This library only reads captures; it does not send or generate packets.
