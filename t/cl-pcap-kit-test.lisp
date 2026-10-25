@@ -1,5 +1,10 @@
 (in-package #:cl-pcap-kit/test)
 
+(cffi:defcfun ("pcap_open_dead" %pcap-open-dead :library cl-pcap-kit::libpcap)
+  :pointer
+  (linktype :int)
+  (snapshot-length :int))
+
 (defun %fixture-path ()
   (asdf:system-relative-pathname "cl-pcap-kit" "tests/fixtures/minimal.pcap"))
 
@@ -98,36 +103,28 @@
   (unless (cl-weave:run-all :reporter :spec :pass-with-no-tests nil)
     (error "cl-pcap-kit test suite failed.")))
 
-(defun %open-test-injector ()
-  (let ((device-names (remove nil (mapcar #'device-name (capture-devices))))
-        (failures '()))
-    (dolist (device-name device-names)
-      (handler-case
-          (return-from %open-test-injector
-            (values (injector-open-live device-name :timeout-ms 1000)
-                    device-name))
-        (pcap-error (condition)
-          (push (format nil "~A: ~A"
-                        device-name
-                        (pcap-error-message condition))
-                failures))))
-    (error "Could not open a live injection handle on any enumerated device: ~{~A~^; ~}"
-           (or (nreverse failures) '("no devices found")))))
+(defun %open-dead-test-injector ()
+  (let ((handle (%pcap-open-dead 1 65535)))
+    (when (cl-pcap-kit::%null-pointer-p handle)
+      (error "pcap_open_dead returned a null handle"))
+    (or (cl-pcap-kit::%make-open-injector handle "pcap_open_dead")
+        (error "could not create an injector from a dead pcap handle"))))
 
 (describe "packet injection binding"
   (it "loads and resolves pcap_sendpacket without transmitting"
-    (expect (fboundp 'cl-pcap-kit::%pcap-sendpacket) :to-be t)
+    (expect (not (null (fboundp 'cl-pcap-kit::%pcap-sendpacket)))
+            :to-be
+            t)
     (expect (not (null (cffi:foreign-symbol-pointer
                         "pcap_sendpacket"
-                        'cl-pcap-kit::libpcap)))
+                        :library 'cl-pcap-kit::libpcap)))
             :to-be
             t))
-  (it "opens and closes an enumerated live injection handle without sending packets"
-    (multiple-value-bind (injector device-name) (%open-test-injector)
-      (format t "Opened live injection handle on ~A; no packets sent.~%" device-name)
+  (it "owns and closes a pcap_open_dead handle without opening a live interface or sending packets"
+    (let ((injector (%open-dead-test-injector)))
+      (format t "Opened pcap_open_dead handle; no live interface or packets used.~%")
       (unwind-protect
            (progn
-             (expect (stringp device-name) :to-be t)
              (expect (injector-closed-p injector) :to-be nil)
              (expect (not (cffi:null-pointer-p
                            (cl-pcap-kit::injector-handle injector)))
@@ -151,3 +148,4 @@
                      :to-be
                      t))
         (close-injector injector)))))
+
