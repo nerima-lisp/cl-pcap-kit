@@ -1,22 +1,22 @@
 (in-package #:cl-pcap-kit)
 
-(defstruct (injector (:constructor %make-injector (handle)))
+(defstruct (injector
+             (:constructor %make-injector (handle))
+             (:conc-name %injector-))
   handle
-  (closed-p nil))
+  (closed-p nil)
+  (lock (sb-thread:make-mutex :name "cl-pcap-kit injector")))
 
-(defun %ensure-injector-open (injector)
+(defun injector-closed-p (injector)
   (check-type injector injector)
-  (when (injector-closed-p injector)
-    (%signal-pcap-error "injector" "injector is already closed"))
-  injector)
+  (sb-thread:with-mutex ((%injector-lock injector))
+    (%injector-closed-p injector)))
 
-(defun %signal-injector-error (injector operation)
-  (let ((message-pointer (%pcap-geterr (injector-handle injector))))
-    (%signal-pcap-error
-     operation
-     (if (%null-pointer-p message-pointer)
-         "unknown libpcap error"
-         (foreign-string-to-lisp message-pointer)))))
+(defun %injector-error-message (injector)
+  (let ((message-pointer (%pcap-geterr (%injector-handle injector))))
+    (if (%null-pointer-p message-pointer)
+        "unknown libpcap error"
+        (foreign-string-to-lisp message-pointer))))
 
 (defun %make-open-injector (handle operation)
   (when (%null-pointer-p handle)
@@ -55,7 +55,7 @@ pcap_open_live, but it does not limit later sends."
 TIMEOUT is accepted for request-callback compatibility, but is not enforced.
 pcap_sendpacket is synchronous and provides no send timeout or cancellation."
   (declare (ignore timeout))
-  (%ensure-injector-open injector)
+  (check-type injector injector)
   (check-type packet (vector (unsigned-byte 8)))
   (let ((length (length packet)))
     (check-type length (integer 1 #x7fffffff))
@@ -63,20 +63,48 @@ pcap_sendpacket is synchronous and provides no send timeout or cancellation."
       (dotimes (index length)
         (setf (cffi:mem-aref foreign-packet :unsigned-char index)
               (aref packet index)))
-      (unless (= (%pcap-sendpacket (injector-handle injector)
-                                   foreign-packet
-                                   length)
-                 0)
-        (%signal-injector-error injector "pcap_sendpacket"))
-      length)))
+      (let ((closed-p nil)
+            (send-result nil)
+            (send-error-message nil)
+            (failure-condition nil))
+        (sb-thread:with-mutex ((%injector-lock injector))
+          (setf closed-p (%injector-closed-p injector))
+          (unless closed-p
+            (handler-case
+                (progn
+                  (setf send-result
+                        (%pcap-sendpacket (%injector-handle injector)
+                                          foreign-packet
+                                          length))
+                  (unless (= send-result 0)
+                    (setf send-error-message
+                          (%injector-error-message injector))))
+              (error (condition)
+                (setf failure-condition condition)))))
+        (when failure-condition
+          (error failure-condition))
+        (when closed-p
+          (%signal-pcap-error "injector" "injector is already closed"))
+        (unless (= send-result 0)
+          (%signal-pcap-error "pcap_sendpacket" send-error-message))
+        length))))
 
 (defun close-injector (injector)
   (check-type injector injector)
-  (unless (injector-closed-p injector)
-    (%pcap-close (injector-handle injector))
-    (setf (injector-closed-p injector) t
-          (injector-handle injector) (cffi:null-pointer)))
-  injector)
+  (let ((handle nil)
+        (failure-condition nil))
+    (sb-thread:with-mutex ((%injector-lock injector))
+      (unless (%injector-closed-p injector)
+        (setf handle (%injector-handle injector)
+              (%injector-closed-p injector) t
+              (%injector-handle injector) (cffi:null-pointer))
+        (handler-case
+            (%pcap-close handle)
+          (error (condition)
+            (setf failure-condition condition)))))
+    (when failure-condition
+      (error failure-condition))
+    injector))
 
 (defmacro with-injector ((variable injector-form) &body body)
   `(let ((,variable ,injector-form))

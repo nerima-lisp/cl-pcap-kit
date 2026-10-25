@@ -111,41 +111,136 @@
         (error "could not create an injector from a dead pcap handle"))))
 
 (describe "packet injection binding"
+  (it "keeps closed handles immutable and serializes sends with close"
+    (let* ((send-symbol (find-symbol "%PCAP-SENDPACKET" "CL-PCAP-KIT"))
+           (original-send (symbol-function send-symbol))
+           (setter-name (list (find-symbol "SETF" "COMMON-LISP")
+                              (find-symbol "INJECTOR-CLOSED-P" "CL-PCAP-KIT")))
+           (pcap-error-type (find-symbol "PCAP-ERROR" "CL-PCAP-KIT"))
+           (packet (make-array 1 :element-type '(unsigned-byte 8)
+                               :initial-element 0))
+           (lifecycle-injector (%open-dead-test-injector))
+           (race-injector (%open-dead-test-injector))
+           (event-lock (sb-thread:make-mutex :name "injector test events"))
+           (send-entered (sb-thread:make-semaphore))
+           (release-send (sb-thread:make-semaphore))
+           (close-attempted (sb-thread:make-semaphore))
+           (send-calls 0)
+           (send-active nil)
+           (block-sends nil)
+           (sender nil)
+           (closer nil))
+      (flet ((finish-thread (thread)
+               (when thread
+                 (multiple-value-bind (result status)
+                     (sb-thread:join-thread thread :timeout 1 :default :timed-out)
+                   (declare (ignore result))
+                   (when (eq status :timeout)
+                     (sb-thread:terminate-thread thread)
+                     (sb-thread:join-thread thread :default :terminated))))))
+        (unwind-protect
+             (progn
+               (setf (symbol-function send-symbol)
+                     (lambda (handle foreign-packet length)
+                       (declare (ignore handle foreign-packet length))
+                       (let ((wait-p nil))
+                         (sb-thread:with-mutex (event-lock)
+                           (incf send-calls)
+                           (setf wait-p block-sends)
+                           (when wait-p
+                             (setf send-active t)))
+                         (when wait-p
+                           (sb-thread:signal-semaphore send-entered)
+                           (sb-thread:wait-on-semaphore release-send)
+                           (sb-thread:with-mutex (event-lock)
+                             (setf send-active nil)))
+                         0)))
+               (expect (not (fboundp setter-name)) :to-be t)
+               (expect (injector-closed-p lifecycle-injector) :to-be nil)
+               (expect (close-injector lifecycle-injector)
+                       :to-be
+                       lifecycle-injector)
+               (expect (injector-closed-p lifecycle-injector) :to-be t)
+               (expect (%signals-condition-p
+                        pcap-error-type
+                        (lambda ()
+                          (injector-send lifecycle-injector packet)))
+                       :to-be
+                       t)
+               (sb-thread:with-mutex (event-lock)
+                 (expect send-calls :to-be 0)
+                 (setf block-sends t))
+               (setf sender
+                     (sb-thread:make-thread
+                      (lambda ()
+                        (injector-send race-injector packet))))
+               (expect (not (null (sb-thread:wait-on-semaphore
+                                  send-entered
+                                  :timeout 1)))
+                       :to-be
+                       t)
+               (setf closer
+                     (sb-thread:make-thread
+                      (lambda ()
+                        (sb-thread:signal-semaphore close-attempted)
+                        (close-injector race-injector)
+                        :closed)))
+               (expect (not (null (sb-thread:wait-on-semaphore
+                                  close-attempted
+                                  :timeout 1)))
+                       :to-be
+                       t)
+               (multiple-value-bind (result status)
+                   (sb-thread:join-thread closer
+                                          :timeout 0.2
+                                          :default :blocked)
+                 (expect status :to-be :timeout)
+                 (expect result :to-be :blocked))
+               (sb-thread:with-mutex (event-lock)
+                 (expect send-calls :to-be 1)
+                 (expect send-active :to-be t))
+               (sb-thread:signal-semaphore release-send)
+               (multiple-value-bind (result status)
+                   (sb-thread:join-thread sender
+                                          :timeout 1
+                                          :default :timed-out)
+                 (expect status :to-be nil)
+                 (expect result :to-be 1))
+               (multiple-value-bind (result status)
+                   (sb-thread:join-thread closer
+                                          :timeout 1
+                                          :default :timed-out)
+                 (expect status :to-be nil)
+                 (expect result :to-be :closed))
+               (expect (injector-closed-p race-injector) :to-be t)
+               (expect (%signals-condition-p
+                        pcap-error-type
+                        (lambda ()
+                          (injector-send race-injector packet)))
+                       :to-be
+                       t)
+               (expect (close-injector race-injector)
+                       :to-be
+                       race-injector)
+               (sb-thread:with-mutex (event-lock)
+                 (expect send-calls :to-be 1)
+                 (expect send-active :to-be nil)))
+          (sb-thread:signal-semaphore release-send)
+          (finish-thread sender)
+          (finish-thread closer)
+          (unless (injector-closed-p lifecycle-injector)
+            (close-injector lifecycle-injector))
+          (unless (injector-closed-p race-injector)
+            (close-injector race-injector))
+          (setf (symbol-function send-symbol) original-send)))))
   (it "loads and resolves pcap_sendpacket without transmitting"
-    (expect (not (null (fboundp 'cl-pcap-kit::%pcap-sendpacket)))
+    (expect (not (null (fboundp (find-symbol "%PCAP-SENDPACKET" "CL-PCAP-KIT"))))
             :to-be
             t)
     (expect (not (null (cffi:foreign-symbol-pointer
                         "pcap_sendpacket"
-                        :library 'cl-pcap-kit::libpcap)))
+                        :library
+                        (find-symbol "LIBPCAP" "CL-PCAP-KIT"))))
             :to-be
-            t))
-  (it "owns and closes a pcap_open_dead handle without opening a live interface or sending packets"
-    (let ((injector (%open-dead-test-injector)))
-      (format t "Opened pcap_open_dead handle; no live interface or packets used.~%")
-      (unwind-protect
-           (progn
-             (expect (injector-closed-p injector) :to-be nil)
-             (expect (not (cffi:null-pointer-p
-                           (cl-pcap-kit::injector-handle injector)))
-                     :to-be
-                     t)
-             (expect (close-injector injector) :to-be injector)
-             (expect (injector-closed-p injector) :to-be t)
-             (expect (cffi:null-pointer-p
-                      (cl-pcap-kit::injector-handle injector))
-                     :to-be
-                     t)
-             (expect (close-injector injector) :to-be injector)
-             (expect (%signals-condition-p
-                      'pcap-error
-                      (lambda ()
-                        (injector-send injector
-                                       (make-array 1
-                                                   :element-type '(unsigned-byte 8)
-                                                   :initial-element 0)
-                                       :timeout 0)))
-                     :to-be
-                     t))
-        (close-injector injector)))))
+            t)))
 
