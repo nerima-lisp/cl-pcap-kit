@@ -97,3 +97,57 @@
 (defun run-tests ()
   (unless (cl-weave:run-all :reporter :spec :pass-with-no-tests nil)
     (error "cl-pcap-kit test suite failed.")))
+
+(defun %open-test-injector ()
+  (let ((device-names (remove nil (mapcar #'device-name (capture-devices))))
+        (failures '()))
+    (dolist (device-name device-names)
+      (handler-case
+          (return-from %open-test-injector
+            (values (injector-open-live device-name :timeout-ms 1000)
+                    device-name))
+        (pcap-error (condition)
+          (push (format nil "~A: ~A"
+                        device-name
+                        (pcap-error-message condition))
+                failures))))
+    (error "Could not open a live injection handle on any enumerated device: ~{~A~^; ~}"
+           (or (nreverse failures) '("no devices found")))))
+
+(describe "packet injection binding"
+  (it "loads and resolves pcap_sendpacket without transmitting"
+    (expect (fboundp 'cl-pcap-kit::%pcap-sendpacket) :to-be t)
+    (expect (not (null (cffi:foreign-symbol-pointer
+                        "pcap_sendpacket"
+                        'cl-pcap-kit::libpcap)))
+            :to-be
+            t))
+  (it "opens and closes an enumerated live injection handle without sending packets"
+    (multiple-value-bind (injector device-name) (%open-test-injector)
+      (format t "Opened live injection handle on ~A; no packets sent.~%" device-name)
+      (unwind-protect
+           (progn
+             (expect (stringp device-name) :to-be t)
+             (expect (injector-closed-p injector) :to-be nil)
+             (expect (not (cffi:null-pointer-p
+                           (cl-pcap-kit::injector-handle injector)))
+                     :to-be
+                     t)
+             (expect (close-injector injector) :to-be injector)
+             (expect (injector-closed-p injector) :to-be t)
+             (expect (cffi:null-pointer-p
+                      (cl-pcap-kit::injector-handle injector))
+                     :to-be
+                     t)
+             (expect (close-injector injector) :to-be injector)
+             (expect (%signals-condition-p
+                      'pcap-error
+                      (lambda ()
+                        (injector-send injector
+                                       (make-array 1
+                                                   :element-type '(unsigned-byte 8)
+                                                   :initial-element 0)
+                                       :timeout 0)))
+                     :to-be
+                     t))
+        (close-injector injector)))))

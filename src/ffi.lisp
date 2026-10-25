@@ -67,3 +67,8 @@
 
 (cffi:defcfun ("pcap_freealldevs" %pcap-freealldevs) :void
   (devices :pointer))
+
+(cffi:defcfun ("pcap_sendpacket" %pcap-sendpacket) :int
+  (handle :pointer)
+  (packet :pointer)
+  (length :int))

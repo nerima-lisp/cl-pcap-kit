@@ -19,6 +19,12 @@
    #:with-offline-capture
    #:with-live-capture
    #:capture-closed-p
+   #:injector
+   #:injector-open-live
+   #:injector-send
+   #:close-injector
+   #:with-injector
+   #:injector-closed-p
    #:packet
    #:packet-timestamp
    #:packet-captured-length

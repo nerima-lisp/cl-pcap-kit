@@ -14,7 +14,8 @@
      (:cffi-grovel-file "grovel/pcap")
      (:file "ffi")
      (:file "types")
-     (:file "capture"))))
+     (:file "capture")
+     (:file "inject"))))
   :in-order-to
   ((asdf:test-op (asdf:test-op "cl-pcap-kit/test"))))
 
